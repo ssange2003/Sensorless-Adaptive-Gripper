@@ -1,95 +1,82 @@
-# Sensorless Adaptive Gripper — Current-based Position Control
+# Sensorless Adaptive Gripper — Load-Feedback Grasping on a Currentless Motor
 
-**Grasping a 1 kg cylinder and a deformable sponge with the same gripper, using only motor current feedback — no force or tactile sensors.**
+**Grasping a 1 kg cylinder and a deformable sponge with the same gripper, using only the motor's load feedback — no force sensors, no tactile sensors, and (as hardware verification revealed) no current sensor either.**
 
-Arduino Uno + Dynamixel Shield controller for a rack-and-pinion gripper (Dynamixel XC430, Protocol 2.0). Object contact, grip force, and object stiffness are all inferred from raw current-register reads, with a direct-register-read pipeline built to avoid the data loss of the library's default burst-read.
+Arduino Uno + DYNAMIXEL Shield controller for a rack-and-pinion gripper (DYNAMIXEL XC430, Protocol 2.0). Contact detection and grip holding are built on **Present Load (Addr 126)** feedback with a detect-then-freeze strategy, and grip-force ceiling via **Goal PWM (Addr 100)**.
 
-> Built for the **2026 Physical AI Gripper Challenge** — **Silver Award (2nd Place)**, Team Union (5 members, cross-department: Robotics + Computer Science).
+> Built for the **2026 Physical AI Gripper Challenge** — **Silver Award (2nd Place)**, Team Union (5 members: Robotics + Computer Science).
+
+---
+
+## Hardware Verification — the Correction That Reshaped This README
+
+The control logic was originally written as "current-based position control (Mode 5) with a goal/holding current." **Verifying against the ROBOTIS e-manual showed the XC430-W150 supports neither:** its control table has no Current-based Position Control mode, no Goal Current (102), no Current Limit (38) — those belong to current-sensored models (XM/XH series). Addr 126 is **Present Load (0.1 % units)**, not Present Current.
+
+So why did the gripper work? Because the parts of the logic that mattered never depended on a current loop:
+
+- The "800" threshold was a **peak load of 80.0 %** — a perfectly valid contact signal
+- The hold was done by **freezing Goal Position at the contact point**, not by the (silently ignored) holding-current write
+- The observed "290" during hold was the **load naturally settling at ~29 %** with the position frozen on the object
+
+The corrected firmware (this repo) renames every register to what it actually is, removes the dead writes, and adds the XC430-native force ceiling: per the e-manual, lowering PWM output lowers torque — so **Goal PWM(100) is capped after contact**, the hardware-accurate equivalent of a holding current.
+
+| | Assumed (before) | Verified (now) |
+|---|---|---|
+| Operating mode | 5 (Current-based Position) | **3 (Position)** — Mode 5 doesn't exist on XC430 |
+| Contact signal | Present Current ≥ 800 | **Present Load ≥ 80.0 %** (Addr 126, 0.1 % units) |
+| Hold mechanism | Goal Current → 290 | **Goal Position frozen at contact** + **Goal PWM cap** |
+| Force ceiling | Current Limit (38) | **Goal PWM (100)** / PWM Limit (36) |
 
 ---
 
 ## Why This Gripper Design
 
-**Design target:** grasp a 1 kg payload, 100 mm-diameter cylinder, without damaging soft/deformable objects — using motor current as the only feedback signal.
-
-That single constraint — *current must be trustworthy* — drove every mechanical and firmware decision below.
+**Design target:** grasp a 1 kg, ⌀100 mm cylinder without damaging soft objects — with motor feedback as the only signal. That constraint — *the feedback must be trustworthy* — drove the mechanical design.
 
 ### 1. Rack-and-Pinion, Not Links or Extra Gearing
 
-A linkage or multi-stage gear train adds backlash and internal friction. Both corrupt the current signal: friction burns current that has nothing to do with grip force, and backlash creates a dead zone between "motor moving" and "jaws actually contacting the object." A direct rack-and-pinion converts motor torque to linear grip force in a single stage — keeping the current-to-force relationship clean enough to detect contact from current alone.
+A linkage or multi-stage gear train adds backlash and internal friction, both of which corrupt the load signal: friction consumes output unrelated to grip force, and backlash creates a dead zone between "motor moving" and "jaws contacting." A single-stage rack-and-pinion keeps the load-to-force relationship clean enough to detect contact from load feedback alone.
 
 ### 2. Mechanical Iteration for a Larger, Heavier Target
 
-The original design (from an earlier gripper built for a Changwon University competition) opened to 8 cm. Redesigned for the 100 mm-cylinder spec:
-
-- Jaw opening widened **8 cm → 10 cm**
-- A guide structure added at the top of the rack to prevent it from **derailing** at the wider stroke
-- **Contact geometry redesigned for form closure, not just friction:**
-  - Box objects: 2-point → **4-point contact**, distributing load and constraining the object geometrically
-  - Cylindrical objects: **contact pads + silicone tape**, oriented along the direction of acceleration so the added friction directly resists gravity/inertial slip during motion
+- Jaw opening widened **8 cm → 10 cm** for the ⌀100 mm spec; a top guide added to keep the rack from derailing at the wider stroke
+- **Form closure over friction:** box grasps moved from 2-point to **4-point contact**; cylinder grasps use contact pads + silicone tape laid along the acceleration direction so added friction directly resists inertial slip
 
 ### 3. FEA-Driven Wall Reinforcement
 
-Design load: static weight (9.81 N) **and** motion at 1.2 G, combined to a 12 N design case — not just the static 1 kg. SOLIDWORKS FEA under this load identified stress concentration at the rack section.
-
-| | Before | After |
-|---|---|---|
-| Rack wall thickness | 4 mm | **7 mm** |
-| Peak Von Mises stress | baseline | **-67%** |
+Design load: 9.81 N static **plus 1.2 G motion → 12 N case**. SOLIDWORKS FEA located stress concentration at the rack section: wall thickness **4 mm → 7 mm**, peak Von Mises stress **−67 %**, verified against physical drive tests.
 
 ---
 
-## Firmware: Getting a Clean Current Signal
+## Firmware: a Clean Load Signal on a Noisy Mechanism
 
-### The Problem: Dynamixel2Arduino's Default Read Drops Current Data
+### Direct Register Reads — Working Around Dropped Data
 
-The library's standard bulk/averaged read returned position and velocity reliably, but **silently failed to return current** — the rack-and-pinion's current signal is noisy enough (constant small torque fluctuations from the gear mesh) that averaged/batched reads lost the data.
+The library's batched/averaged read returned position and velocity but failed to return the load value. Fix: **read the register directly and assemble the raw bytes sequentially**, giving lossless real-time feedback. (Root cause not conclusively established — documented as observed behavior + workaround.)
 
-**Fix:** read the current register directly, unpacking the raw 4-byte value bit-by-bit in sequence instead of relying on the library's batched read. This gave lossless, real-time current feedback.
-
-### Object Detection Logic — Peak Current, Not Target Current
+### Detection: Peak Load, Not Steady-State Target
 
 ```cpp
-if (abs(cur) >= 800 || (abs(vel) < 3 && abs(cur) >= (targetCur - 10))) {
-    if (++stallCount > 1) {
-        dxl.write(MOTOR_ID, ADDR_GOAL_CURRENT, (uint8_t*)&holdCur, 2);
-        dxl.write(MOTOR_ID, ADDR_GOAL_POSITION, (uint8_t*)&pos, 4);
+if (abs(load) >= STALL_LOAD || (abs(vel) < 3 && abs(load) >= CONTACT_LOAD)) {
+    if (++stallCount > 1) {                     // 2-read debounce vs gear-mesh noise
+        dxl.write(MOTOR_ID, ADDR_GOAL_POSITION, (uint8_t*)&pos, 4);  // freeze at contact
+        setPwm(PWM_HOLD);                       // cap output torque (e-manual: lower PWM = lower torque)
         return;
     }
 }
 ```
 
-An early version watched for velocity ≈ 0 at the *target* current — but in Current-Position mode, the motor's drive toward the goal position takes priority even at zero velocity, so current still spikes to the ceiling regardless of contact. Reading a **peak current threshold (800)** instead of the steady-state target current catches the contact event before that override happens.
+An early version waited for velocity ≈ 0 at a target level — but in position control the drive toward the goal position dominates, so output spikes to the ceiling at stall regardless of contact. Watching for the **80 % peak load transient** catches contact before that, and the immediate freeze + PWM cap minimizes the crush window — the difference between holding a sponge and flattening it.
 
-`stallCount` requires the condition to hold for 2 consecutive reads — a simple debounce against single-sample current noise from gear mesh vibration.
+### Bluetooth Override
 
-### Detect → Hold — Minimizing Crush Time on Soft Objects
-
-Once contact is confirmed, current is immediately reduced from the closing current to a lower **holding current**, and the goal position is frozen at the current position (not the original closed target). This shortens the window where inertia keeps compressing the object after contact — the difference between crushing a sponge and just holding it.
-
-### Bluetooth Override (Safety / Demo Interrupt)
-
-`SoftwareSerial` on pins 4/5 listens for a `'1'` byte during `safeClose()`; receiving it aborts the grip cycle and calls `safeOpen()` immediately — a manual kill switch during testing/demo.
+`SoftwareSerial` (pins 4/5) accepts `'1'` mid-close to abort and reopen — manual kill switch for testing and demos.
 
 ---
 
-## Hardware Integration Lesson: Power, Not Just Firmware
+## Hardware Integration Lesson: Power Path
 
-Arduino Uno and the Dynamixel Shield share a single UART. The first assumption was that power also had to be fully isolated between them — but a shared ground with a single external supply proved stable.
-
-**What did matter:** feed order. Powering shield→Arduino (rather than Arduino→shield) reduces back-current stress and voltage-drop on the Arduino's regulator, confirmed against the datasheet, since the Arduino side runs at lower voltage/current than the shield.
-
-**What was learned the hard way:** without adequate isolation from the Vin jumper, the Arduino's onboard voltage regulator couldn't dissipate the heat from the shield's current draw — it overheated and **took out both the Arduino and a Dynamixel** before this was diagnosed. Fix: pull the Vin jumper cap to separate the supply paths.
-
----
-
-## Design Evolution — Operating Mode
-
-| Stage | Mode | Result |
-|---|---|---|
-| 1 | Position (jaws open/close to fixed positions) | worked, but no force awareness |
-| 2 | Naive Current control, safety-factor 2.2 on a static force model | current too unstable for reliable grasp |
-| 3 | **Current-based Position Control (Mode 5)**, target/hold current tuned from a 1st-order force model, safety factor 2 (final friction ceiling set by silicone-tape testing) | stable, adaptive grasp — this repo |
+Uno and the DYNAMIXEL Shield share one UART; power turned out to be the real issue. External supply goes to the **shield**, sharing Vin — datasheet-confirmed as the direction that minimizes back-current and voltage-drop stress on the Uno's regulator. Learned destructively: before pulling the Vin jumper cap to separate supply paths, the Uno's regulator overheated and **took out both the Arduino and a Dynamixel**.
 
 ---
 
@@ -97,17 +84,16 @@ Arduino Uno and the Dynamixel Shield share a single UART. The first assumption w
 
 | Item | Value | Source |
 |---|---|---|
-| Operating Mode | 5 — Current-based Position Control | `ADDR_OPERATING_MODE = 11` |
-| Stall/contact detection threshold | **800** (current register) | `turtlebot3`-style peak-current logic, `safeClose()` |
-| Debounce | 2 consecutive reads (`stallCount`) | noise filtering |
-| Design load | 9.81 N (static) + 1.2 G motion → **12 N** | FEA load case |
-| Rack wall thickness | 4 mm → **7 mm** | FEA iteration |
-| Peak Von Mises stress reduction | **67%** | SOLIDWORKS FEA, before/after |
-| Jaw opening | 8 cm → **10 cm** | mechanical redesign for 100 mm cylinder |
-| Target payload | 1 kg, ⌀100 mm cylinder | competition spec |
-| Max motor current avoided | 1.4 A (motor rated max) | current-limit design margin |
-
-> **Note on current values in code:** `targetCur`/`holdCur` are set to `111` in this snippet; the design narrative above describes a tuned hold current of 290. If this file is a pre-tuning test version, update the table/code before publishing final numbers — the stall-detection threshold (800) is confirmed consistent between code and design notes.
+| Motor | DYNAMIXEL XC430, Protocol 2.0 | — |
+| Operating mode | **3** (Position Control) | e-manual: XC430 mode list |
+| Contact threshold | Present Load ≥ **800** (= 80.0 %) | Addr 126, 0.1 % units |
+| Debounce | 2 consecutive reads | `stallCount` |
+| Hold mechanism | Goal Position freeze + **Goal PWM cap** (start 186 / 885) | Addr 116 + Addr 100 |
+| Hold-state load (observed) | ~**290** (= 29.0 %) | telemetry during hold |
+| Design load case | 9.81 N + 1.2 G → **12 N** | FEA input |
+| Rack wall | 4 mm → **7 mm**, Von Mises **−67 %** | SOLIDWORKS FEA |
+| Jaw opening | 8 cm → **10 cm** | ⌀100 mm target |
+| Payload | **1 kg** rigid → soft sponge, damage-free | competition runs |
 
 ---
 
@@ -115,4 +101,4 @@ Arduino Uno and the Dynamixel Shield share a single UART. The first assumption w
 
 **Kim Minsang (김민상)** — Robotics Engineering, Yeungnam University · Team Lead, Union
 Embedded systems · Sensorless control · Mechanical design
-Build log: https://blog.naver.com/kms031103 · LinkedIn: https://www.linkedin.com/in/kms2003
+Build log & post-mortems: https://blog.naver.com/kms031103 · LinkedIn: https://www.linkedin.com/in/kms2003
