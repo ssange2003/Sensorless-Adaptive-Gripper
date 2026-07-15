@@ -116,4 +116,5 @@ https://github.com/user-attachments/assets/a6fd81db-1d35-4e6a-a121-cd43c0ed2529
 
 **Kim Minsang (김민상)** — Robotics Engineering, Yeungnam University · Team Lead, Union
 Embedded systems · Sensorless control · Mechanical design
-Build log: https://blog.naver.com/kms031103 · LinkedIn: https://www.linkedin.com/in/kms2003
+Build log: https://blog.naver.com/kms031103 
+LinkedIn: https://www.linkedin.com/in/kms2003
