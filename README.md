@@ -18,9 +18,10 @@ That single constraint cascades through the whole design:
 2. If the motor can't limit its own force, **the firmware must decide when to stop pushing** → drives the detection logic (detect → freeze → cap, below)
 
 ---
-https://github.com/user-attachments/assets/03d6598d-9146-4126-b5b0-8b7c821c736f https://github.com/user-attachments/assets/5b7e54a1-e827-46ed-bcd9-bcc52cb237d8
-
-https://github.com/user-attachments/assets/a79d367a-1ab1-4b7c-bffc-c289bf25a757 https://github.com/user-attachments/assets/a6fd81db-1d35-4e6a-a121-cd43c0ed2529
+https://github.com/user-attachments/assets/03d6598d-9146-4126-b5b0-8b7c821c736f
+https://github.com/user-attachments/assets/5b7e54a1-e827-46ed-bcd9-bcc52cb237d8
+https://github.com/user-attachments/assets/a79d367a-1ab1-4b7c-bffc-c289bf25a757 
+https://github.com/user-attachments/assets/a6fd81db-1d35-4e6a-a121-cd43c0ed2529
 
 ## How It Works
 
